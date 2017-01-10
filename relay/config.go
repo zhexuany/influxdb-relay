@@ -18,6 +18,9 @@ type HTTPConfig struct {
 	// Addr should be set to the desired listening host:port
 	Addr string `toml:"bind-addr"`
 
+	// Set gzip
+	Gzip bool `toml:"gzip"`
+
 	// Set certificate in order to handle HTTPS requests
 	SSLCombinedPem string `toml:"ssl-combined-pem"`
 

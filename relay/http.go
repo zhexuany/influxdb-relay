@@ -25,6 +25,7 @@ type HTTP struct {
 	name   string
 	schema string
 
+	gzip bool
 	cert string
 	rp   string
 
@@ -49,6 +50,7 @@ func NewHTTP(cfg HTTPConfig) (Relay, error) {
 	h.addr = cfg.Addr
 	h.name = cfg.Name
 
+	h.gzip = cfg.Gzip
 	h.cert = cfg.SSLCombinedPem
 	h.rp = cfg.DefaultRetentionPolicy
 
@@ -58,7 +60,7 @@ func NewHTTP(cfg HTTPConfig) (Relay, error) {
 	}
 
 	for i := range cfg.Outputs {
-		backend, err := newHTTPBackend(&cfg.Outputs[i])
+		backend, err := newHTTPBackend(&cfg.Outputs[i], cfg.Gzip)
 		if err != nil {
 			return nil, err
 		}
@@ -114,9 +116,9 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	if r.URL.Path == "/ping" && (r.Method == "GET" || r.Method == "HEAD") {
-			w.Header().Add("X-InfluxDB-Version", "relay")
-			w.WriteHeader(http.StatusNoContent)
-			return
+		w.Header().Add("X-InfluxDB-Version", "relay")
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 
 	if r.URL.Path != "/write" {
@@ -174,12 +176,37 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	outBuf := getBuf()
-	for _, p := range points {
-		if _, err = outBuf.WriteString(p.PrecisionString(precision)); err != nil {
-			break
+	if h.gzip {
+		writer := gzip.NewWriter(outBuf)
+
+		for _, p := range points {
+			if _, err := writer.Write([]byte(p.PrecisionString(precision))); err != nil {
+				log.Println(err)
+				return
+			}
+
+			if _, err := writer.Write([]byte("\n")); err != nil {
+				log.Println(err)
+				return
+			}
 		}
-		if err = outBuf.WriteByte('\n'); err != nil {
-			break
+
+		if err := writer.Flush(); err != nil {
+			log.Println(err)
+			return
+		}
+		if err := writer.Close(); err != nil {
+			log.Println(err)
+			return
+		}
+	} else {
+		for _, p := range points {
+			if _, err = outBuf.WriteString(p.PrecisionString(precision)); err != nil {
+				break
+			}
+			if err = outBuf.WriteByte('\n'); err != nil {
+				break
+			}
 		}
 	}
 
@@ -292,9 +319,10 @@ type poster interface {
 type simplePoster struct {
 	client   *http.Client
 	location string
+	gzip     bool
 }
 
-func newSimplePoster(location string, timeout time.Duration, skipTLSVerification bool) *simplePoster {
+func newSimplePoster(location string, timeout time.Duration, skipTLSVerification, gzip bool) *simplePoster {
 	// Configure custom transport for http.Client
 	// Used for support skip-tls-verification option
 	transport := &http.Transport{
@@ -309,6 +337,7 @@ func newSimplePoster(location string, timeout time.Duration, skipTLSVerification
 			Transport: transport,
 		},
 		location: location,
+		gzip:     gzip,
 	}
 }
 
@@ -321,6 +350,9 @@ func (b *simplePoster) post(buf []byte, query string, auth string) (*responseDat
 	req.URL.RawQuery = query
 	req.Header.Set("Content-Type", "text/plain")
 	req.Header.Set("Content-Length", strconv.Itoa(len(buf)))
+	if b.gzip {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
 	if auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
@@ -352,7 +384,7 @@ type httpBackend struct {
 	name string
 }
 
-func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
+func newHTTPBackend(cfg *HTTPOutputConfig, gzip bool) (*httpBackend, error) {
 	if cfg.Name == "" {
 		cfg.Name = cfg.Location
 	}
@@ -366,7 +398,7 @@ func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
 		timeout = t
 	}
 
-	var p poster = newSimplePoster(cfg.Location, timeout, cfg.SkipTLSVerification)
+	var p poster = newSimplePoster(cfg.Location, timeout, cfg.SkipTLSVerification, gzip)
 
 	// If configured, create a retryBuffer per backend.
 	// This way we serialize retries against each backend.
