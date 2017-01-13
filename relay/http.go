@@ -323,11 +323,23 @@ func (h *HTTP) serveQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := retryAllBackends(h.backends, fn)
+
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	w.Write(resp.Body)
+
+	switch resp.StatusCode / 100 {
+	case 2:
+		w.WriteHeader(http.StatusOK)
+		w.Write(resp.Body)
+		return
+
+	case 4:
+		// user error
+		resp.Write(w)
+		return
+	}
 }
 
 func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
