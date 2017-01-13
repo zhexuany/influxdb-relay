@@ -21,9 +21,10 @@ import (
 
 // HTTP is a relay for HTTP influxdb writes
 type HTTP struct {
-	addr   string
-	name   string
-	schema string
+	addr     string
+	name     string
+	schema   string
+	database string
 
 	gzip bool
 	cert string
@@ -53,6 +54,7 @@ func NewHTTP(cfg HTTPConfig) (Relay, error) {
 	h.gzip = cfg.Gzip
 	h.cert = cfg.SSLCombinedPem
 	h.rp = cfg.DefaultRetentionPolicy
+	h.database = cfg.Database
 
 	h.schema = "http"
 	if h.cert != "" {
@@ -112,36 +114,34 @@ func (h *HTTP) Stop() error {
 	return h.l.Close()
 }
 
-func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *HTTP) WrapHandler(name string, hf http.HandlerFunc) http.Handler {
+	var handler http.Handler
+	handler = http.HandlerFunc(hf)
+	return handler
+}
+
+func (h *HTTP) servePing(w http.ResponseWriter, r *http.Request) {
+	//TODO ping should check all backend and return error if any of
+	// them can not be pinged
+	w.Header().Add("X-InfluxDB-Version", "relay")
+	w.WriteHeader(http.StatusNoContent)
+	return
+}
+
+func (h *HTTP) serveWrite(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-
-	if r.URL.Path == "/ping" && (r.Method == "GET" || r.Method == "HEAD") {
-		w.Header().Add("X-InfluxDB-Version", "relay")
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	if r.URL.Path != "/write" {
-		jsonError(w, http.StatusNotFound, "invalid write endpoint")
-		return
-	}
-
-	if r.Method != "POST" {
-		w.Header().Set("Allow", "POST")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-		} else {
-			jsonError(w, http.StatusMethodNotAllowed, "invalid write method")
-		}
-		return
-	}
 
 	queryParams := r.URL.Query()
 
 	// fail early if we're missing the database
-	if queryParams.Get("db") == "" {
+	db := queryParams.Get("db")
+	if db == "" {
 		jsonError(w, http.StatusBadRequest, "missing parameter: db")
 		return
+	}
+
+	if db != h.database {
+		http.Error(w, "wrong database parameter", http.StatusBadRequest)
 	}
 
 	if queryParams.Get("rp") == "" && h.rp != "" {
@@ -283,6 +283,35 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	errResponse.Write(w)
 }
 
+func (h *HTTP) serveQuery(w http.ResponseWriter, r *http.Request) {
+}
+
+func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		switch r.URL.Path {
+		case "/ping":
+			h.WrapHandler("ping", h.servePing)
+		}
+	case "POST":
+		switch r.URL.Path {
+		case "/write":
+			h.WrapHandler("write", h.serveWrite)
+		case "/query":
+			h.WrapHandler("query", h.serveQuery)
+		}
+	default:
+		w.Header().Set("Allow", "POST")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+		} else {
+			jsonError(w, http.StatusMethodNotAllowed, "invalid write method")
+		}
+		http.Error(w, "", http.StatusBadRequest)
+	}
+
+}
+
 type responseData struct {
 	ContentType     string
 	ContentEncoding string
@@ -379,6 +408,8 @@ func (b *simplePoster) post(buf []byte, query string, auth string) (*responseDat
 	}, nil
 }
 
+// a httpBackend contains mutiple poster, name and database name. Per request, determine the db first and
+// write such request in all poster if db matches what it has
 type httpBackend struct {
 	poster
 	name string

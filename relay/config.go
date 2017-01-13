@@ -18,6 +18,9 @@ type HTTPConfig struct {
 	// Addr should be set to the desired listening host:port
 	Addr string `toml:"bind-addr"`
 
+	// Set Database in order to post data to right spot
+	Database string `toml:"database"`
+
 	// Set gzip
 	Gzip bool `toml:"gzip"`
 
