@@ -125,6 +125,7 @@ func (h *HTTP) servePing(w http.ResponseWriter, r *http.Request) {
 	// them can not be pinged
 	w.Header().Add("X-InfluxDB-Version", "relay")
 	w.WriteHeader(http.StatusNoContent)
+
 	return
 }
 
@@ -236,7 +237,7 @@ func (h *HTTP) serveWrite(w http.ResponseWriter, r *http.Request) {
 		b := b
 		go func() {
 			defer wg.Done()
-			resp, err := b.post(outBytes, query, authHeader)
+			resp, err := b.post(outBytes, query, authHeader, "write")
 			if err != nil {
 				log.Printf("Problem posting to relay %q backend %q: %v", h.Name(), b.name, err)
 			} else {
@@ -283,7 +284,50 @@ func (h *HTTP) serveWrite(w http.ResponseWriter, r *http.Request) {
 	errResponse.Write(w)
 }
 
+func retryAllBackends(backends []*httpBackend, fn func(b *httpBackend) (*responseData, error)) (*responseData, error) {
+	for _, b := range backends {
+		resp, err := fn(b)
+		if err == nil {
+			return resp, nil
+		}
+	}
+
+	return nil, errors.New("failed to query in all nodes")
+}
+
 func (h *HTTP) serveQuery(w http.ResponseWriter, r *http.Request) {
+	queryParam := r.URL.Query()
+	db := queryParam.Get("db")
+	qp := queryParam.Get("q")
+	if qp == "" {
+		http.Error(w, "mising required parameter q", http.StatusBadRequest)
+		return
+	}
+
+	if db == "" {
+		http.Error(w, "mising required parameter db", http.StatusBadRequest)
+		return
+	}
+
+	if db != h.database {
+		http.Error(w, "database does not match", http.StatusBadRequest)
+		return
+	}
+
+	// check for authorization performed via the header
+	authHeader := r.Header.Get("Authorization")
+
+	bodyB := []byte(fmt.Sprintf("db=%s&q=%s", db, qp))
+	fn := func(b *httpBackend) (*responseData, error) {
+		return b.post(bodyB, "", authHeader, "query")
+	}
+
+	resp, err := retryAllBackends(h.backends, fn)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Write(resp.Body)
 }
 
 func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -292,13 +336,13 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/ping":
 			h.WrapHandler("ping", h.servePing)
+		case "/query":
+			h.WrapHandler("query", h.serveQuery)
 		}
 	case "POST":
 		switch r.URL.Path {
 		case "/write":
 			h.WrapHandler("write", h.serveWrite)
-		case "/query":
-			h.WrapHandler("query", h.serveQuery)
 		}
 	default:
 		w.Header().Set("Allow", "POST")
@@ -342,7 +386,7 @@ func jsonError(w http.ResponseWriter, code int, message string) {
 }
 
 type poster interface {
-	post([]byte, string, string) (*responseData, error)
+	post([]byte, string, string, string) (*responseData, error)
 }
 
 type simplePoster struct {
@@ -370,8 +414,13 @@ func newSimplePoster(location string, timeout time.Duration, skipTLSVerification
 	}
 }
 
-func (b *simplePoster) post(buf []byte, query string, auth string) (*responseData, error) {
-	req, err := http.NewRequest("POST", b.location, bytes.NewReader(buf))
+func (b *simplePoster) post(buf []byte, query string, auth string, method string) (*responseData, error) {
+	//in case of location is not absolute, concat a backslash
+	if b.location[len(b.location)] != '/' {
+		b.location += "/"
+	}
+	location := b.location + method
+	req, err := http.NewRequest("POST", location, bytes.NewReader(buf))
 	if err != nil {
 		return nil, err
 	}
